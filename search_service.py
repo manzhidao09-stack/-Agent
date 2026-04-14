@@ -223,15 +223,26 @@ def _resolve_llm_auth() -> tuple[str, str, str] | None:
     return None
 
 
+def _llm_route_is_openai_only() -> bool:
+    """当前路由为 OpenAI（未配置 DeepSeek），可用于 json_object 等仅 OpenAI 稳定支持的参数。"""
+    return bool((os.environ.get("OPENAI_API_KEY") or "").strip()) and not bool(
+        (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+    )
+
+
 def llm_chat(
     messages: list[dict[str, str]],
     *,
     temperature: float = 0.3,
     max_tokens: int = 512,
+    json_object: bool = False,
 ) -> str | None:
     """
     OpenAI 兼容 Chat Completions，支持 system/user 多轮。
     供 agents 等多智能体场景复用；统一在首条 system 中注入柠季品牌全局背景。
+
+    json_object：在「仅 OpenAI、未配 DeepSeek」时尝试附带 response_format=json_object；
+    若服务端返回 400（例如兼容网关不支持该字段），会自动重试不带该字段的请求。
     """
     auth = _resolve_llm_auth()
     if not auth:
@@ -245,29 +256,44 @@ def llm_chat(
         return None
 
     msgs = _messages_with_brand_context(messages)
-    payload = {
+    payload: dict[str, Any] = {
         "model": model,
         "messages": msgs,
         "max_tokens": max_tokens,
         "temperature": temperature,
     }
+    attempts: list[dict[str, Any]] = [dict(payload)]
+    if json_object and _llm_route_is_openai_only():
+        attempts.insert(0, {**payload, "response_format": {"type": "json_object"}})
+
     try:
         with httpx.Client(timeout=90.0) as client:
-            r = client.post(
-                url,
-                headers={"Authorization": f"Bearer {key}"},
-                json=payload,
-            )
-            r.raise_for_status()
-            data = r.json()
-        text = (data["choices"][0]["message"]["content"] or "").strip()
-        prompt_chars = sum(
-            len(m.get("content") or "") for m in msgs if isinstance(m, dict)
-        )
-        add_llm_chars(prompt_chars + len(text))
-        return text
+            for body in attempts:
+                try:
+                    r = client.post(
+                        url,
+                        headers={"Authorization": f"Bearer {key}"},
+                        json=body,
+                    )
+                    r.raise_for_status()
+                    data = r.json()
+                except httpx.HTTPStatusError as e:
+                    if (
+                        e.response is not None
+                        and e.response.status_code == 400
+                        and body.get("response_format")
+                    ):
+                        continue
+                    return None
+                text = (data["choices"][0]["message"]["content"] or "").strip()
+                prompt_chars = sum(
+                    len(m.get("content") or "") for m in msgs if isinstance(m, dict)
+                )
+                add_llm_chars(prompt_chars + len(text))
+                return text
     except Exception:
         return None
+    return None
 
 
 def _llm_openai_compatible(user_prompt: str) -> str | None:
