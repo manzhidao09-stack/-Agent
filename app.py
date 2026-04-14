@@ -34,6 +34,7 @@ from notification_service import send_enterprise_notification
 import search_service  # noqa: F401
 from engine import calculate_site_roi
 from schema import SiteInput
+from spy_service import build_competitor_intel_dataframe
 
 # 与 engine.py 中 ROI 公式保持一致
 _DAYS_PER_MONTH = 30
@@ -840,6 +841,24 @@ if mode == "单店评估":
 
                 st.subheader("市场情报")
                 st.text(result.market_intelligence or "（无）")
+
+                st.subheader("竞品情报看板")
+                with st.spinner(
+                    "正在侦察全网竞品情报（美团/点评/抖音/京东视角的公开摘录 + 模型清洗）…"
+                ):
+                    spy_df = build_competitor_intel_dataframe(site.address)
+                if spy_df.empty:
+                    st.info(
+                        "暂未生成竞品情报表。请确认已配置 TAVILY_API_KEY 与 "
+                        "DEEPSEEK_API_KEY（或 OPENAI_API_KEY），并稍后重试。"
+                    )
+                else:
+                    st.dataframe(spy_df, use_container_width=True, height=360)
+                st.caption(
+                    "说明：本看板基于联网搜索公开网页摘录经大模型结构化整理，"
+                    "不等同于各平台官方实时排行或内部数据接口。"
+                )
+
                 img_info = st.session_state.get("site_image_analysis")
                 if isinstance(img_info, dict) and img_info.get("ok"):
                     st.subheader("现场图片考察补充")
