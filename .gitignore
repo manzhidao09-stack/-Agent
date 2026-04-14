@@ -1,0 +1,6 @@
+search_cache.sqlite
+.env
+.env.local
+evaluations/
+__pycache__/
+*.pyc
