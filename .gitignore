@@ -4,3 +4,4 @@ search_cache.sqlite
 evaluations/
 __pycache__/
 *.pyc
+.streamlit/secrets.toml

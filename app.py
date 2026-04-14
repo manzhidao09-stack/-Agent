@@ -26,6 +26,8 @@ from geopy.location import Location
 from pydantic import ValidationError
 
 import guardrails  # noqa: F401
+from email_service import send_assessment_email
+from notification_service import send_enterprise_notification
 import search_service  # noqa: F401
 from engine import calculate_site_roi
 from schema import SiteInput
@@ -65,6 +67,31 @@ _SHANGHAI_ROAD_EN: tuple[tuple[str, str], ...] = (
     ("福州路", "Fuzhou Road"),
     ("人民广场", "People's Square"),
 )
+
+
+def _notification_summary(address: str, margin_pct: float, conclusion: str) -> str:
+    """统一通知文案：地址、利润率、核心结论。"""
+    return (
+        "【选址评估通知】\n"
+        f"地址：{address}\n"
+        f"利润率：{margin_pct:.2f}%\n"
+        f"核心结论：{conclusion}"
+    )
+
+
+def _email_payload(site: SiteInput, result: Any) -> dict[str, Any]:
+    """构造邮件服务所需字段。"""
+    return {
+        "address": site.address,
+        "monthly_rent_cny": site.monthly_rent_cny,
+        "estimated_monthly_revenue_cny": result.estimated_monthly_revenue_cny,
+        "estimated_net_margin_pct": result.estimated_net_margin_pct,
+        "roi_pct": result.estimated_net_margin_pct,
+        "expansion_approved": result.expansion_approved,
+        "risk_block_reason": result.risk_block_reason or "",
+        "promoter_opinion": result.promoter_opinion or "",
+        "critic_opinion": result.critic_opinion or "",
+    }
 
 # 批量表列名兼容（优先匹配左侧别名；见 _norm_header 规范化）
 _COLUMN_ALIASES: dict[str, list[str]] = {
@@ -568,6 +595,21 @@ st.markdown(
 )
 
 with st.sidebar:
+    st.subheader("访问验证")
+    expected_access_token = str(st.secrets.get("ACCESS_TOKEN", "")).strip()
+    access_token_input = st.text_input(
+        "请输入访问令牌",
+        type="password",
+        key="access_token_input",
+        help="令牌由管理员在 Streamlit secrets 中配置（ACCESS_TOKEN）。",
+    )
+    if not expected_access_token:
+        st.error("后台未配置 ACCESS_TOKEN，请先在 secrets 中设置后再使用。")
+        st.stop()
+    if access_token_input != expected_access_token:
+        st.warning("请输入正确的令牌以开启决策系统")
+        st.stop()
+
     mode = st.radio(
         "评估模式",
         ["单店评估", "批量评估"],
@@ -613,6 +655,27 @@ if mode == "单店评估":
             else:
                 with st.spinner("正在评估（情报检索、双智能体辩论、红线校验）…"):
                     result = calculate_site_roi(site)
+                single_conclusion = (
+                    "准予拓店"
+                    if result.expansion_approved
+                    else (result.risk_block_reason or "拒绝拓店（原因未提供）")
+                )
+                notify_ok = send_enterprise_notification(
+                    _notification_summary(
+                        site.address,
+                        float(result.estimated_net_margin_pct),
+                        single_conclusion,
+                    )
+                )
+                email_ok = send_assessment_email(_email_payload(site, result))
+                if notify_ok:
+                    st.caption("通知已发送给管理者。")
+                else:
+                    st.caption("通知发送失败或未配置 Webhook。")
+                if email_ok:
+                    st.caption("评估邮件已发送。")
+                else:
+                    st.caption("评估邮件发送失败或未配置 SMTP。")
 
                 st.subheader("核心指标")
                 m1, m2 = st.columns(2)
@@ -687,6 +750,10 @@ else:
                         st.warning("表格为空。")
                     else:
                         rows_out: list[dict[str, Any]] = []
+                        notify_success = 0
+                        notify_failed = 0
+                        email_success = 0
+                        email_failed = 0
                         with st.status("批量评估进行中", expanded=True) as run_status:
                             progress = st.progress(0)
                             for idx, (_, row) in enumerate(df_in.iterrows()):
@@ -726,6 +793,31 @@ else:
                                             or "",
                                         }
                                     )
+                                    row_conclusion = (
+                                        "准予拓店"
+                                        if result.expansion_approved
+                                        else (
+                                            result.risk_block_reason or "拒绝拓店"
+                                        )
+                                    )
+                                    notify_ok = send_enterprise_notification(
+                                        _notification_summary(
+                                            addr_display,
+                                            float(result.estimated_net_margin_pct),
+                                            row_conclusion,
+                                        )
+                                    )
+                                    if notify_ok:
+                                        notify_success += 1
+                                    else:
+                                        notify_failed += 1
+                                    email_ok = send_assessment_email(
+                                        _email_payload(site, result)
+                                    )
+                                    if email_ok:
+                                        email_success += 1
+                                    else:
+                                        email_failed += 1
                                 except Exception as ex:
                                     try:
                                         raw_addr = row[colmap["address"]]
@@ -763,6 +855,12 @@ else:
 
                         st.subheader("点位空间分布图")
                         _render_batch_site_map(summary_df)
+                        st.caption(
+                            f"通知推送统计：成功 {notify_success} 条，失败/未配置 {notify_failed} 条。"
+                        )
+                        st.caption(
+                            f"邮件发送统计：成功 {email_success} 条，失败/未配置 {email_failed} 条。"
+                        )
 
                         csv_bytes = summary_df.to_csv(index=False).encode("utf-8-sig")
                         st.download_button(

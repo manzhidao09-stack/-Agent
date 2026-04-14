@@ -18,15 +18,49 @@ _LL_ENV_KEYS = (
 )
 
 
+def _show_missing_api_key_error_once() -> None:
+    """仅在 Streamlit 页面环境提示一次缺少 API 密钥。"""
+    try:
+        import streamlit as st
+
+        flag = "_missing_api_key_error_shown"
+        if st.session_state.get(flag):
+            return
+        st.session_state[flag] = True
+        st.error("未配置 API 密钥，请检查后台设置")
+    except Exception:
+        # CLI / 非 Streamlit 运行时忽略
+        return
+
+
 def _bootstrap_env() -> None:
     """
-    从项目根目录 .env / .env.local 加载变量（需 python-dotenv），
-    并在仍无 LLM 密钥时尝试从 Streamlit secrets 写入 os.environ。
+    Streamlit Cloud 优先：先从 st.secrets 读取；本地兜底：再从 .env / .env.local 读取。
 
     说明：仅 `os.environ` 时，在资源管理器双击运行、或未继承你「终端里 export」
     的进程里会读不到密钥；用 .env 或与 Streamlit 一致的 secrets 可避免。
     """
     root = Path(__file__).resolve().parent
+    # 1) 优先 st.secrets（Streamlit Cloud 标准方式）
+    try:
+        import streamlit as st
+
+        sec = getattr(st, "secrets", None)
+        if sec is not None:
+            for key in _LL_ENV_KEYS:
+                try:
+                    if key not in sec:
+                        continue
+                except Exception:
+                    continue
+                val = sec[key]
+                if val is None or not str(val).strip():
+                    continue
+                os.environ[key] = str(val).strip()
+    except Exception:
+        pass
+
+    # 2) 兜底 .env / .env.local（仅填充仍缺失的键）
     try:
         from dotenv import load_dotenv
 
@@ -35,31 +69,6 @@ def _bootstrap_env() -> None:
             if p.is_file():
                 load_dotenv(p, override=False)
     except ImportError:
-        pass
-
-    has_llm = (os.environ.get("DEEPSEEK_API_KEY") or "").strip() or (
-        os.environ.get("OPENAI_API_KEY") or ""
-    ).strip()
-    if has_llm:
-        return
-    try:
-        import streamlit as st
-
-        sec = getattr(st, "secrets", None)
-        if sec is None:
-            return
-        for key in _LL_ENV_KEYS:
-            try:
-                if key not in sec:
-                    continue
-            except Exception:
-                continue
-            val = sec[key]
-            if val is None or not str(val).strip():
-                continue
-            if not (os.environ.get(key) or "").strip():
-                os.environ[key] = str(val).strip()
-    except Exception:
         pass
 
 
@@ -156,6 +165,7 @@ def _gather_tavily_raw(address: str) -> str:
 
     key = _api_key()
     if not key:
+        _show_missing_api_key_error_once()
         raise RuntimeError("tavily_key_missing")
 
     query = f"{address} 周边茶饮店分布及商圈人流实时评价"
@@ -225,6 +235,7 @@ def llm_chat(
     """
     auth = _resolve_llm_auth()
     if not auth:
+        _show_missing_api_key_error_once()
         return None
     key, base, model = auth
     url = f"{base}/chat/completions"
