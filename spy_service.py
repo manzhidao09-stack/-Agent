@@ -25,6 +25,21 @@ def _tavily_api_key() -> str:
     return (os.environ.get("TAVILY_API_KEY") or "").strip()
 
 
+def _llm_configured() -> bool:
+    return bool(
+        (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
+        or (os.environ.get("OPENAI_API_KEY") or "").strip()
+    )
+
+
+def _tavily_import_ok() -> bool:
+    try:
+        import tavily  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
 def _response_to_dict(response: Any) -> dict[str, Any]:
     if isinstance(response, dict):
         return response
@@ -112,7 +127,13 @@ def _extract_json_array(text: str) -> list[dict[str, Any]]:
     try:
         data = json.loads(s)
     except json.JSONDecodeError:
-        return []
+        m = re.search(r"\[[\s\S]*\]", s)
+        if not m:
+            return []
+        try:
+            data = json.loads(m.group(0))
+        except json.JSONDecodeError:
+            return []
     if isinstance(data, dict):
         inner = data.get("items") or data.get("data") or data.get("rows")
         if isinstance(inner, list):
@@ -128,14 +149,17 @@ def _extract_json_array(text: str) -> list[dict[str, Any]]:
     return out
 
 
-def structure_spy_intel(address: str, raw_snippets: str) -> list[dict[str, Any]]:
+def structure_spy_intel(
+    address: str, raw_snippets: str
+) -> tuple[list[dict[str, Any]], str]:
     """
     使用 DeepSeek/OpenAI（经 search_service.llm_chat）将杂乱摘录清洗为结构化 JSON 数组。
     每项字段：品牌、评分、人均消费、月销、核心差评点、平台。
+    第二个返回值："" 表示成功；否则为失败原因码（llm_empty / parse_fail）。
     """
     raw = (raw_snippets or "").strip()
     if not raw:
-        return []
+        return [], "no_raw"
     sys_msg = (
         "你是商业情报清洗专家。请仅依据输入摘录抽取信息，禁止编造摘录中不存在的品牌、"
         "评分、销量、价格。无法从摘录支持时填「不详」。"
@@ -154,14 +178,14 @@ def structure_spy_intel(address: str, raw_snippets: str) -> list[dict[str, Any]]
         max_tokens=2400,
     )
     if not text:
-        return []
-    return _extract_json_array(text)
+        return [], "llm_empty"
+    rows = _extract_json_array(text)
+    if not rows:
+        return [], "parse_fail"
+    return rows, ""
 
 
-def build_competitor_intel_dataframe(address: str) -> pd.DataFrame:
-    """返回可直接用于 st.dataframe 的竞品情报表。"""
-    raw = gather_cross_platform_intel(address)
-    rows = structure_spy_intel(address, raw)
+def _rows_to_dataframe(rows: list[dict[str, Any]]) -> pd.DataFrame:
     cols = ["品牌", "评分", "人均消费", "月销", "核心差评点", "平台"]
     if not rows:
         return pd.DataFrame(columns=cols)
@@ -178,6 +202,67 @@ def build_competitor_intel_dataframe(address: str) -> pd.DataFrame:
             }
         )
     return pd.DataFrame(norm)
+
+
+def build_competitor_intel_table(address: str) -> tuple[pd.DataFrame, str]:
+    """
+    返回 (DataFrame, 说明)。
+    DataFrame 为空时，说明字符串给出可操作的失败原因。
+    """
+    cols = ["品牌", "评分", "人均消费", "月销", "核心差评点", "平台"]
+    empty = pd.DataFrame(columns=cols)
+    addr = (address or "").strip()
+    if not addr:
+        return empty, "地址为空，无法检索竞品情报。"
+
+    if not _tavily_api_key():
+        return (
+            empty,
+            "未检测到 **TAVILY_API_KEY**：请在 Streamlit Cloud Secrets 或本地 `.streamlit/secrets.toml` "
+            "中配置，并重新部署/刷新页面。",
+        )
+    if not _tavily_import_ok():
+        return (
+            empty,
+            "未安装 **tavily-python**：请在运行环境执行 `python -m pip install tavily-python`。",
+        )
+    if not _llm_configured():
+        return (
+            empty,
+            "未检测到 **DEEPSEEK_API_KEY** 或 **OPENAI_API_KEY**：竞品表需要 LLM 将摘录清洗为结构化 JSON。",
+        )
+
+    raw = gather_cross_platform_intel(addr)
+    excerpt_lines = sum(1 for line in raw.splitlines() if line.strip().startswith("["))
+    if excerpt_lines == 0:
+        return (
+            empty,
+            "Tavily 未返回有效网页摘录（检索无命中、配额用尽或网络异常）。可尝试把地址写得更具体（含区/路），"
+            "或稍后再试。",
+        )
+
+    rows, err = structure_spy_intel(addr, raw)
+    if not rows:
+        if err == "llm_empty":
+            return (
+                empty,
+                "大模型返回为空：请检查 **DEEPSEEK_API_KEY / OPENAI_API_KEY** 是否有效、"
+                "额度是否充足，或网络是否能访问对应 API。",
+            )
+        if err == "parse_fail":
+            return (
+                empty,
+                "大模型有返回，但无法解析为 JSON 数组。可尝试降低模型温度或更换模型；"
+                "也可能是模型输出了解释性文字。",
+            )
+        return empty, "结构化清洗失败（原因未知）。"
+    return _rows_to_dataframe(rows), ""
+
+
+def build_competitor_intel_dataframe(address: str) -> pd.DataFrame:
+    """返回可直接用于 st.dataframe 的竞品情报表（无说明文本）。"""
+    df, _ = build_competitor_intel_table(address)
+    return df
 
 
 def fetch_platform_intelligence(address: str) -> pd.DataFrame:
