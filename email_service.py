@@ -10,13 +10,17 @@ from typing import Any
 
 import streamlit as st
 
-_SMTP_HOST_KEY = "SMTP_HOST"
-_SMTP_PORT_KEY = "SMTP_PORT"
-_SMTP_USER_KEY = "SMTP_USER"
+_SMTP_SERVER_KEY = "SMTP_SERVER"
+_SMTP_USERNAME_KEY = "SMTP_USERNAME"
 _SMTP_PASSWORD_KEY = "SMTP_PASSWORD"
-_SMTP_FROM_KEY = "SMTP_FROM"
-_SMTP_TO_KEY = "SMTP_TO"
-_SMTP_USE_TLS_KEY = "SMTP_USE_TLS"
+_EMAIL_SENDER_KEY = "EMAIL_SENDER"
+_EMAIL_RECEIVER_KEY = "EMAIL_RECEIVER"
+
+# 兼容历史命名（若新键不存在则回退）
+_LEGACY_SMTP_HOST_KEY = "SMTP_HOST"
+_LEGACY_SMTP_USER_KEY = "SMTP_USER"
+_LEGACY_SMTP_FROM_KEY = "SMTP_FROM"
+_LEGACY_SMTP_TO_KEY = "SMTP_TO"
 
 
 def _to_plain_dict(data: Any) -> dict[str, Any]:
@@ -83,6 +87,22 @@ def _assessment_fields(assessment_data: Any) -> dict[str, Any]:
     }
 
 
+def _secret_with_fallback(primary: str, *fallbacks: str) -> str:
+    keys = (primary, *fallbacks)
+    for k in keys:
+        v = str(st.secrets.get(k, "")).strip()
+        if v:
+            return v
+    return ""
+
+
+def _required_secret(primary: str, error_label: str, *fallbacks: str) -> str:
+    val = _secret_with_fallback(primary, *fallbacks)
+    if not val:
+        st.error(f"缺失 {error_label} 配置")
+    return val
+
+
 def _subject(info: dict[str, Any]) -> str:
     return f"【柠季选址告警】{info['address']} - {info['decision']}"
 
@@ -137,18 +157,27 @@ def send_assessment_email(assessment_data: Any) -> bool:
     安全性：仅使用 st.secrets 读取 SMTP 配置；失败返回 False，不影响页面展示。
     """
     try:
-        smtp_host = str(st.secrets.get(_SMTP_HOST_KEY, "")).strip()
-        smtp_port = int(st.secrets.get(_SMTP_PORT_KEY, 587))
-        smtp_user = str(st.secrets.get(_SMTP_USER_KEY, "")).strip()
-        smtp_password = str(st.secrets.get(_SMTP_PASSWORD_KEY, "")).strip()
-        smtp_from = str(st.secrets.get(_SMTP_FROM_KEY, smtp_user)).strip()
-        smtp_to_raw = str(st.secrets.get(_SMTP_TO_KEY, "")).strip()
-        use_tls = _as_bool(st.secrets.get(_SMTP_USE_TLS_KEY, True), default=True)
+        smtp_host = _required_secret(
+            _SMTP_SERVER_KEY, "SMTP_SERVER", _LEGACY_SMTP_HOST_KEY
+        )
+        smtp_user = _required_secret(
+            _SMTP_USERNAME_KEY, "SMTP_USERNAME", _LEGACY_SMTP_USER_KEY
+        )
+        smtp_password = _required_secret(_SMTP_PASSWORD_KEY, "SMTP_PASSWORD")
+        smtp_from = _required_secret(
+            _EMAIL_SENDER_KEY, "EMAIL_SENDER", _LEGACY_SMTP_FROM_KEY
+        )
+        smtp_to_raw = _required_secret(
+            _EMAIL_RECEIVER_KEY, "EMAIL_RECEIVER", _LEGACY_SMTP_TO_KEY
+        )
+        # 云端环境优先使用 587 + STARTTLS（相较 465 SSL 更稳）
+        smtp_port = 587
 
         recipients = [x.strip() for x in smtp_to_raw.split(",") if x.strip()]
         if not smtp_host or not smtp_user or not smtp_password or not recipients:
-            st.error("邮件发送失败：SMTP 配置不完整，请检查 st.secrets。")
             return False
+
+        st.write(f"正在尝试通过 {st.secrets.get('SMTP_SERVER')} 发送邮件...")
 
         info = _assessment_fields(assessment_data)
         msg = MIMEMultipart("alternative")
@@ -158,8 +187,7 @@ def send_assessment_email(assessment_data: Any) -> bool:
         msg.attach(MIMEText(_html_body(info), "html", "utf-8"))
 
         with smtplib.SMTP(smtp_host, smtp_port, timeout=20) as server:
-            if use_tls:
-                server.starttls()
+            server.starttls()
             server.login(smtp_user, smtp_password)
             server.sendmail(smtp_from, recipients, msg.as_string())
         return True
