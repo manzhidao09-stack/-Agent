@@ -9,7 +9,9 @@
 
 from __future__ import annotations
 
+import base64
 import io
+import json
 import re
 import time
 import unicodedata
@@ -18,6 +20,7 @@ from typing import Any
 import folium
 import pandas as pd
 import plotly.express as px
+import requests
 import streamlit as st
 import streamlit.components.v1 as components
 from geopy.exc import GeocoderServiceError, GeocoderTimedOut
@@ -92,6 +95,91 @@ def _email_payload(site: SiteInput, result: Any) -> dict[str, Any]:
         "promoter_opinion": result.promoter_opinion or "",
         "critic_opinion": result.critic_opinion or "",
     }
+
+
+def analyze_site_image(image_file: Any) -> dict[str, Any]:
+    """
+    调用 Gemini 1.5 Flash 对现场图片做选址解析。
+    返回结构化字段，失败时返回 {"ok": False, "error": "..."}。
+    """
+    api_key = str(st.secrets.get("GEMINI_API_KEY", "")).strip()
+    if not api_key:
+        return {"ok": False, "error": "缺失 GEMINI_API_KEY 配置"}
+    model = str(st.secrets.get("GEMINI_MODEL", "gemini-1.5-flash")).strip()
+    if not model:
+        model = "gemini-1.5-flash"
+
+    mime_type = getattr(image_file, "type", "") or "image/jpeg"
+    if not str(mime_type).startswith("image/"):
+        return {"ok": False, "error": "仅支持图片文件（image/*）"}
+
+    image_bytes = image_file.getvalue()
+    if not image_bytes:
+        return {"ok": False, "error": "上传图片为空"}
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+
+    prompt = (
+        "你是“资深选址考察官”。请仅基于图片内容提取信息，禁止编造。"
+        "请严格返回 JSON（不要 Markdown、不要额外说明），字段如下："
+        '{'
+        '"contact_phone":"",'
+        '"store_area_sqm":null,'
+        '"rent_requirement_text":"",'
+        '"transfer_fee_text":"",'
+        '"competitor_brands":[""],'
+        '"crowd_quality":"",'
+        '"summary":"",'
+        '"confidence":"高/中/低"'
+        "}"
+        "；其中："
+        "1) contact_phone 提取招租电话；"
+        "2) store_area_sqm 仅填数字（平米），不确定填 null；"
+        "3) competitor_brands 仅列画面可见同类品牌（如古茗/茶百道/瑞幸等）；"
+        "4) crowd_quality 根据建筑形态与人群特征判断消费能力，并简述依据。"
+    )
+
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+        f"?key={api_key}"
+    )
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {"text": prompt},
+                    {
+                        "inline_data": {
+                            "mime_type": mime_type,
+                            "data": image_b64,
+                        }
+                    },
+                ]
+            }
+        ],
+        "generationConfig": {
+            "temperature": 0.2,
+            "responseMimeType": "application/json",
+        },
+    }
+    try:
+        resp = requests.post(url, json=payload, timeout=45)
+        resp.raise_for_status()
+        data = resp.json()
+        text = (
+            data.get("candidates", [{}])[0]
+            .get("content", {})
+            .get("parts", [{}])[0]
+            .get("text", "")
+        )
+        if not text:
+            return {"ok": False, "error": "Gemini 未返回可解析文本"}
+        parsed = json.loads(text)
+        if not isinstance(parsed, dict):
+            return {"ok": False, "error": "Gemini 返回结构异常"}
+        parsed["ok"] = True
+        return parsed
+    except Exception as e:
+        return {"ok": False, "error": f"图像解析失败：{e}"}
 
 # 批量表列名兼容（优先匹配左侧别名；见 _norm_header 规范化）
 _COLUMN_ALIASES: dict[str, list[str]] = {
@@ -618,7 +706,38 @@ with st.sidebar:
     st.divider()
     if mode == "单店评估":
         st.header("点位参数")
+        site_image = st.file_uploader(
+            "上传店址现场图片（招租告示/街道实景）",
+            type=["jpg", "jpeg", "png", "webp"],
+            help="用于 AI 提取面积、联系方式、竞品与客群线索。",
+        )
+        if st.button("解析现场图片", use_container_width=True):
+            if site_image is None:
+                st.warning("请先上传现场图片。")
+            else:
+                with st.spinner("正在调用 Gemini 解析现场图片…"):
+                    image_result = analyze_site_image(site_image)
+                if image_result.get("ok"):
+                    st.session_state["site_image_analysis"] = image_result
+                    area_v = image_result.get("store_area_sqm")
+                    if area_v not in (None, ""):
+                        try:
+                            st.session_state["store_area_sqm_input"] = float(area_v)
+                        except Exception:
+                            pass
+                    phone_v = str(image_result.get("contact_phone", "")).strip()
+                    if phone_v:
+                        st.session_state["site_contact"] = phone_v
+                    st.success("图片解析完成，已尝试自动回填面积与联系方式。")
+                else:
+                    st.error(str(image_result.get("error") or "图片解析失败"))
+
         address = st.text_input("地址", placeholder="例如：上海市静安区南京西路某号")
+        _site_contact = st.text_input(
+            "现场联系方式（可自动识别）",
+            key="site_contact",
+            placeholder="例如：13800000000",
+        )
         monthly_rent_cny = st.number_input("月租金（元）", min_value=0, value=20_000, step=500)
         estimated_daily_cups = st.number_input("预估日出杯量（杯）", min_value=0, value=400, step=10)
         avg_ticket_cny = st.number_input("平均客单价（元）", min_value=0.01, value=25.0, step=0.5)
@@ -628,6 +747,7 @@ with st.sidebar:
             min_value=0.01,
             value=60.0,
             step=1.0,
+            key="store_area_sqm_input",
             help="SiteInput 必填，用于模型与政策校验。",
         )
     else:
@@ -720,6 +840,35 @@ if mode == "单店评估":
 
                 st.subheader("市场情报")
                 st.text(result.market_intelligence or "（无）")
+                img_info = st.session_state.get("site_image_analysis")
+                if isinstance(img_info, dict) and img_info.get("ok"):
+                    st.subheader("现场图片考察补充")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.write(f"联系方式：{img_info.get('contact_phone') or '未识别'}")
+                        st.write(
+                            f"面积线索：{img_info.get('store_area_sqm') or '未识别'} 平米"
+                        )
+                        st.write(
+                            "租金要求："
+                            + str(img_info.get("rent_requirement_text") or "未识别")
+                        )
+                        st.write(
+                            "转让费用："
+                            + str(img_info.get("transfer_fee_text") or "未识别")
+                        )
+                    with c2:
+                        brands = img_info.get("competitor_brands") or []
+                        if isinstance(brands, list):
+                            btxt = "、".join(str(x) for x in brands if str(x).strip())
+                        else:
+                            btxt = str(brands)
+                        st.write(f"可见竞品品牌：{btxt or '未识别'}")
+                        st.write(
+                            "客群质量判断："
+                            + str(img_info.get("crowd_quality") or "未识别")
+                        )
+                        st.caption(str(img_info.get("summary") or ""))
 
 else:
     st.subheader("批量评估")
