@@ -11,6 +11,7 @@ import json
 import os
 import re
 import time
+from urllib.parse import quote_plus
 from typing import Any
 
 import pandas as pd
@@ -19,6 +20,11 @@ from search_service import llm_chat
 
 _TAVILY_THROTTLE_SEC = 1.05
 _MAX_RAW_FOR_LLM = 14_000
+_MOBILE_UA = (
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_3 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 "
+    "Mobile/15E148 Safari/604.1"
+)
 
 
 def _tavily_api_key() -> str:
@@ -30,6 +36,10 @@ def _llm_configured() -> bool:
         (os.environ.get("DEEPSEEK_API_KEY") or "").strip()
         or (os.environ.get("OPENAI_API_KEY") or "").strip()
     )
+
+
+def _deepseek_configured() -> bool:
+    return bool((os.environ.get("DEEPSEEK_API_KEY") or "").strip())
 
 
 def _tavily_import_ok() -> bool:
@@ -116,6 +126,112 @@ def gather_cross_platform_intel(address: str) -> str:
         chunks.append(_format_hits(label, hits))
         time.sleep(_TAVILY_THROTTLE_SEC)
     return "\n\n".join(chunks)
+
+
+def _firecrawl_search_pages(address: str) -> list[tuple[str, str]]:
+    q = quote_plus(f"{address} 茶饮 柠檬茶 评分 月销")
+    return [
+        ("大众点评H5", f"https://m.dianping.com/searchshopall?query={q}"),
+        ("美团H5", f"https://i.meituan.com/s/{q}"),
+        ("抖音搜索", f"https://www.douyin.com/search/{quote_plus(address + ' 柠檬茶')}"),
+    ]
+
+
+def _firecrawl_mobile_scrape(address: str) -> str:
+    """
+    使用 Firecrawl 抓取移动端搜索页文本，附加手机 UA 降低反爬命中率。
+    返回拼接后的粗文本，供 DeepSeek 降噪抽取。
+    """
+    key = (os.environ.get("FIRECRAWL_API_KEY") or "").strip()
+    if not key:
+        return ""
+    try:
+        from firecrawl import FirecrawlApp
+    except Exception:
+        return ""
+
+    app = FirecrawlApp(api_key=key)
+    chunks: list[str] = []
+    for label, url in _firecrawl_search_pages(address):
+        try:
+            # 兼容 firecrawl-py 不同版本参数结构
+            response = app.scrape_url(
+                url,
+                params={
+                    "formats": ["markdown"],
+                    "onlyMainContent": False,
+                    "headers": {"User-Agent": _MOBILE_UA},
+                },
+            )
+        except TypeError:
+            try:
+                response = app.scrape_url(
+                    url,
+                    formats=["markdown"],
+                    only_main_content=False,
+                    headers={"User-Agent": _MOBILE_UA},
+                )
+            except Exception:
+                continue
+        except Exception:
+            continue
+        payload = _response_to_dict(response)
+        md = (
+            str(payload.get("markdown") or "").strip()
+            or str((payload.get("data") or {}).get("markdown") or "").strip()
+            or str(payload.get("content") or "").strip()
+        )
+        if not md:
+            continue
+        chunks.append(f"=== {label} Firecrawl抓取 ===\nurl={url}\n{md[:7000]}")
+        time.sleep(0.4)
+    return "\n\n".join(chunks)
+
+
+def _deepseek_extract_competitors(address: str, noisy_text: str) -> list[dict[str, Any]]:
+    """
+    让 DeepSeek 对混乱网页文本做降噪抽取：
+    1) 前 3 名茶饮店
+    2) 所有柠檬茶店
+    """
+    if not _deepseek_configured():
+        return []
+    raw = (noisy_text or "").strip()
+    if not raw:
+        return []
+    sys_msg = (
+        "你是网页情报降噪专家。"
+        "这是一段从点评网页抓取的混乱文本，请帮我从中提取出前 3 名茶饮店和所有柠檬茶店的店名、月销和评分。"
+        "输出必须是合法 JSON 对象，不要 Markdown，不要解释性文字。"
+        '严格格式：{"items":[{"品牌":"","评分":"","月销":"","平台":"","类别":""}]}。'
+        "类别只能是“前3茶饮”或“柠檬茶”，字段缺失填“不详”。"
+    )
+    user_msg = f"点位：{address}\n\n抓取文本：\n{raw[:12000]}"
+    txt = llm_chat(
+        [
+            {"role": "system", "content": sys_msg},
+            {"role": "user", "content": user_msg},
+        ],
+        temperature=0.0,
+        max_tokens=1800,
+        json_object=False,
+    )
+    if not txt:
+        return []
+    rows = _extract_json_array(txt)
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        out.append(
+            {
+                "品牌": str(row.get("品牌", "不详") or "不详"),
+                "评分": str(row.get("评分", "不详") or "不详"),
+                "人均消费": "不详",
+                "月销": str(row.get("月销", "不详") or "不详"),
+                "核心差评点": "不详",
+                "平台": str(row.get("平台", "大众点评") or "大众点评"),
+            }
+        )
+    return out
 
 
 def _normalize_smart_quotes(s: str) -> str:
@@ -321,8 +437,11 @@ def build_competitor_intel_table(address: str) -> tuple[pd.DataFrame, str]:
         )
 
     raw = gather_cross_platform_intel(addr)
+    firecrawl_raw = _firecrawl_mobile_scrape(addr)
+    if firecrawl_raw:
+        raw = f"{raw}\n\n{firecrawl_raw}".strip()
     excerpt_lines = sum(1 for line in raw.splitlines() if line.strip().startswith("["))
-    if excerpt_lines == 0:
+    if excerpt_lines == 0 and not firecrawl_raw:
         return (
             empty,
             "Tavily 未返回有效网页摘录（检索无命中、配额用尽或网络异常）。可尝试把地址写得更具体（含区/路），"
@@ -338,11 +457,14 @@ def build_competitor_intel_table(address: str) -> tuple[pd.DataFrame, str]:
                 "额度是否充足，或网络是否能访问对应 API。",
             )
         if err == "parse_fail":
+            ds_rows = _deepseek_extract_competitors(addr, raw)
+            if ds_rows:
+                return _rows_to_dataframe(ds_rows), ""
             return (
                 empty,
-                "大模型有返回，但无法解析为结构化 JSON（期望形如 `{\"items\":[...]}` 或顶层数组）。"
-                "请重试一次；若使用 DeepSeek，可在环境变量中改用 **`DEEPSEEK_MODEL`** 指向更遵从指令的模型；"
-                "若网关不支持 OpenAI 的 `json_object` 模式，系统会自动回退为普通补全。",
+                "大模型有返回，但无法解析为结构化 JSON。"
+                "已尝试 Firecrawl + DeepSeek 降噪兜底仍失败，请确认 **FIRECRAWL_API_KEY** 与 "
+                "**DEEPSEEK_API_KEY** 已配置，并稍后重试。",
             )
         return empty, "结构化清洗失败（原因未知）。"
     return _rows_to_dataframe(rows), ""
