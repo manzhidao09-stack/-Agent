@@ -322,6 +322,35 @@ def _try_json_load_rows(s: str) -> list[dict[str, Any]]:
         return []
 
 
+def _is_valid_json_payload(text: str) -> bool:
+    """
+    判断文本是否为“可解析 JSON 负载”（即使 rows 为空也算解析成功），
+    用于区分“解析失败”与“解析成功但无有效门店行”。
+    """
+    s = _normalize_smart_quotes((text or "").strip())
+    if not s:
+        return False
+    s = s.lstrip("\ufeff")
+    s = _unwrap_markdown_code(s)
+    candidates: list[str] = []
+    if s:
+        candidates.append(s)
+    obj = _slice_balanced(s, "{", "}")
+    if obj and obj not in candidates:
+        candidates.append(obj)
+    arr = _slice_balanced(s, "[", "]")
+    if arr and arr not in candidates:
+        candidates.append(arr)
+    for cand in candidates:
+        for variant in (cand, _repair_trailing_commas(cand)):
+            try:
+                json.loads(variant)
+                return True
+            except json.JSONDecodeError:
+                continue
+    return False
+
+
 def _extract_json_array(text: str) -> list[dict[str, Any]]:
     """
     从大模型回复中解析竞品行：支持 {"items":[...]}、顶层数组、代码块、前后废话、尾随逗号。
@@ -356,7 +385,7 @@ def structure_spy_intel(
     """
     使用 DeepSeek/OpenAI（经 search_service.llm_chat）将杂乱摘录清洗为结构化 JSON 数组。
     每项字段：品牌、评分、人均消费、月销、核心差评点、平台。
-    第二个返回值："" 表示成功；否则为失败原因码（llm_empty / parse_fail）。
+    第二个返回值："" 表示成功；否则为失败原因码（llm_empty / parse_fail / no_rows）。
     """
     raw = (raw_snippets or "").strip()
     if not raw:
@@ -385,6 +414,8 @@ def structure_spy_intel(
         return [], "llm_empty"
     rows = _extract_json_array(text)
     if not rows:
+        if _is_valid_json_payload(text):
+            return [], "no_rows"
         return [], "parse_fail"
     return rows, ""
 
@@ -455,6 +486,12 @@ def build_competitor_intel_table(address: str) -> tuple[pd.DataFrame, str]:
                 empty,
                 "大模型返回为空：请检查 **DEEPSEEK_API_KEY / OPENAI_API_KEY** 是否有效、"
                 "额度是否充足，或网络是否能访问对应 API。",
+            )
+        if err == "no_rows":
+            return (
+                empty,
+                "模型已返回合法 JSON，但未提取到可用门店行（可能该地址公开信息较少，或检索文本噪声较高）。"
+                "可尝试补充更精确地址（区/路/商场名）后重试。",
             )
         if err == "parse_fail":
             ds_rows = _deepseek_extract_competitors(addr, raw)
